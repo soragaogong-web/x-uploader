@@ -1,0 +1,24 @@
+name: upload
+
+on:
+  workflow_dispatch:
+
+# 同時に2つ動かない(あとから来た起動は、前の実行が終わるまで待つ)
+concurrency:
+  group: upload
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests requests-oauthlib
+      - run: python upload.py
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+          AR_KEY: ${{ secrets.AR_KEY }}
