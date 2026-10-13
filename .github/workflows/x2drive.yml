@@ -1,0 +1,24 @@
+name: x2drive
+
+on:
+  workflow_dispatch:
+
+# 同時に2つ動かない（あとから来た起動は、前の実行が終わるまで待つ）
+concurrency:
+  group: x2drive
+  cancel-in-progress: false
+
+jobs:
+  save:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python x2drive.py
+        env:
+          X2D_GAS_URL: ${{ secrets.X2D_GAS_URL }}
+          X2D_KEY: ${{ secrets.X2D_KEY }}
