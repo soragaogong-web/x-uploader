@@ -36,8 +36,9 @@
  *      X_BEARER_TOKEN = （X Developer Portal で発行した Bearer Token）を追加し、C列をチェック
  *   6. 自動化したい場合はメニュー「1時間ごとの自動実行をON」
  *
- * ■ 大きい動画（50MB超）
- *   Apps Script では受け取れないので「大きい動画」シートに入れ、GitHub Actions の Python（x-uploader の x2drive.py）が保存する
+ * ■ 動画（GitHub連携を登録した場合）
+ *   Apps Script でダウンロードするとメモリ不足で止まることがあるので、動画はすべて「大きい動画」シートに入れ、
+ *   GitHub Actions の Python（x-uploader の x2drive.py）が保存する。画像は今までどおり Apps Script が保存する
  *   設定はメニュー「X→Drive」→「大きい動画（50MB超）」から（ファイルの一番下に説明あり）
  *
  * ■ 制限
@@ -399,7 +400,7 @@ function syncAccount_(token, name, folder, idx, deadline) {
 
   return `最新まで取得済み（今回 保存${cnt.saved} / 重複${cnt.skipped}` +
     (cnt.failed ? ` / 失敗${cnt.failed}（logシート参照）` : '') +
-    (bigQueued_ ? ` / 大きい動画${bigQueued_}件はGitHubで保存` : '') + '）';
+    (bigQueued_ ? ` / 動画${bigQueued_}件はGitHubで保存` : '') + '）';
 }
 
 function getBearerToken_() {
@@ -533,6 +534,19 @@ function savePost_(idx, folder, post, deadline) {
   for (const m of post.media) {
     if (Date.now() > deadline) return { saved, skipped, failed, finished: false };
     if (idx.keys.has(fid + '|' + m.key)) { skipped++; continue; }
+
+    // 動画は Apps Script でダウンロードすると「メモリ不足」で実行ごと止まることがあるため、
+    // 大きさに関係なく GitHub（Python）に保存を頼む（GitHub連携が未登録なら従来どおりここで保存）
+    if (m.type !== 'photo' && bigEnabled_()) {
+      const fileNameV = `${post.author}_${post.id}_${m.index + 1}.${m.ext}`;
+      const targetV = CONFIG.SUBFOLDER_PER_POST ? getOrCreateSubfolder_(folder, `${post.author}_${post.id}`) : folder;
+      bigEnqueue_({ key: m.key, postId: post.id, postUrl: post.url, type: m.type, name: fileNameV,
+        folderId: targetV.getId(), indexFolderId: fid, url: m.url, account: post.author });
+      idx.sh.appendRow([m.key, post.id, post.url, m.type, fileNameV, '', 'big-queued', new Date(), post.author, fid]);
+      idx.keys.add(fid + '|' + m.key);
+      bigQueued_++;
+      continue;
+    }
 
     // 1つ失敗しても止めずに次へ進む（以前は1つの失敗でそのアカウント全体が止まっていた）
     let res;
@@ -681,6 +695,12 @@ const BIG = {
 
 function bigSheet_() { return getSheet_(BIG.SHEET, BIG.HEADER); }
 
+/** GitHub連携が登録済みか（登録済みなら動画は全部 GitHub に任せる） */
+function bigEnabled_() {
+  const p = PropertiesService.getScriptProperties();
+  return !!(p.getProperty('X2D_GH_REPO') && p.getProperty('X2D_GH_TOKEN'));
+}
+
 function bigEnqueue_(j) {
   bigSheet_().appendRow([Utilities.getUuid(), '待ち', j.account, j.postUrl, j.name, j.folderId, j.key, j.type,
     j.postId, j.indexFolderId, j.url, '', new Date()]);
@@ -765,7 +785,7 @@ function bigShowKey() {
     '<p>GitHub の x-uploader →「Settings」→「Secrets and variables」→「Actions」に、次の2つを登録してください。</p>' +
     '<p><b>X2D_GAS_URL</b><br><input style="width:100%" readonly value="' + esc(url) + '" onclick="this.select()"></p>' +
     '<p><b>X2D_KEY</b><br><input style="width:100%" readonly value="' + esc(key) + '" onclick="this.select()"></p>' +
-    '<p style="color:#666">URLが …/dev で終わる場合は、「デプロイを管理」に出ている …/exec のURLを使ってください。</p></div>'
+    '<p style="color:#c00">X2D_GAS_URL は、Apps Script の「デプロイ」→「デプロイを管理」に出ているウェブアプリのURL（…/exec）を使ってください。上のURLと違う場合は、そちらが正しいURLです。</p></div>'
   ).setWidth(560).setHeight(300);
   SpreadsheetApp.getUi().showModalDialog(html, 'Python用の合言葉とURL');
 }
