@@ -30,11 +30,29 @@ def mask(value):
         print(f"::add-mask::{value}", flush=True)
 
 
-def gas(params):
+def gas(params, tries=4):
+    """GAS とやりとりする。混んでいて変な返事が来たときは、少し待って何回かやり直す"""
     params = dict(params, key=AR_KEY)
-    r = requests.get(GAS_URL, params=params, timeout=120)
-    r.raise_for_status()
-    return r.json()
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(GAS_URL, params=params, timeout=120)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(5 * (i + 1))
+    raise RuntimeError(f"GASとの通信に失敗({params.get('ar')}): {str(last)[:120]}")
+
+
+def body(r, step):
+    """X の返事を読む。空・壊れた返事のときは、どの手順かわかるエラーにする"""
+    if not r.text.strip():
+        return {}
+    try:
+        return r.json()
+    except ValueError:
+        raise RuntimeError(f"X {step}: 返事が読めません({r.status_code}) {r.text[:120]}")
 
 
 def download(file_id, token, path):
@@ -61,7 +79,7 @@ def upload_to_x(job, path):
     r = check(requests.post(f"{X_UPLOAD}/initialize", auth=auth, timeout=60,
                             json={"media_type": mime, "media_category": "tweet_video", "total_bytes": total}),
               "initialize")
-    data = r.json().get("data", {})
+    data = body(r, "initialize").get("data", {})
     media_id = str(data.get("id") or data.get("media_id") or "")
     if not media_id:
         raise RuntimeError("X initialize: 動画IDが返ってきません")
@@ -79,7 +97,8 @@ def upload_to_x(job, path):
             index += 1
 
     r = check(requests.post(f"{X_UPLOAD}/{media_id}/finalize", auth=auth, timeout=60), "finalize")
-    info = (r.json().get("data") or {}).get("processing_info")
+    fin = body(r, "finalize")
+    info = (fin.get("data") or {}).get("processing_info") if fin else {"state": "pending", "check_after_secs": 3}
     waited = 0
     while info and info.get("state") not in ("succeeded",):
         if info.get("state") == "failed":
@@ -92,7 +111,7 @@ def upload_to_x(job, path):
             raise RuntimeError("Xでの動画処理が10分たっても終わりません")
         r = check(requests.get(X_UPLOAD, auth=auth, timeout=60,
                                params={"command": "STATUS", "media_id": media_id}), "STATUS")
-        info = (r.json().get("data") or {}).get("processing_info")
+        info = (body(r, "STATUS").get("data") or {}).get("processing_info")
     return media_id
 
 
@@ -119,16 +138,24 @@ def main():
                 try:
                     download(job["fileId"], token, path)
                     media_id = upload_to_x(job, path)
-                    gas({"ar": "done", "job": job["id"], "media": media_id})
-                    print(f"予定 {job['id']}: 完了", flush=True)
-                    done += 1
                 except Exception as e:  # noqa: BLE001
-                    msg = str(e)[:300]
-                    print(f"予定 {job['id']}: 失敗 {msg}", flush=True)
+                    media_id = None
+                    err = e
+                if media_id:
+                    # アップロードはできたので、GASへの報告だけ何回かやり直す(失敗扱いにはしない)
                     try:
-                        gas({"ar": "fail", "job": job["id"], "err": msg})
-                    except Exception:  # noqa: BLE001
-                        pass
+                        gas({"ar": "done", "job": job["id"], "media": media_id})
+                        print(f"予定 {job['id']}: 完了", flush=True)
+                        done += 1
+                    except Exception as e2:  # noqa: BLE001
+                        print(f"予定 {job['id']}: アップロードはできたが、GASへの報告に失敗 {str(e2)[:120]}", flush=True)
+                    continue
+                msg = str(err)[:300]
+                print(f"予定 {job['id']}: 失敗 {msg}", flush=True)
+                try:
+                    gas({"ar": "fail", "job": job["id"], "err": msg})
+                except Exception:  # noqa: BLE001
+                    pass
     print(f"おわり(アップロード {done}件)", flush=True)
 
 
