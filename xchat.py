@@ -249,11 +249,14 @@ def url_card(x, chat, conv, key, text, note):
 
 
 def url_entities(text):
-    """本文の中のURLに「ここはリンク」の印を付ける(位置はUTF-8のバイト数で数える: X Chat の決まり)"""
+    """本文の中のURLに「ここはリンク」の印を付ける。
+    位置はアプリと同じ数え方(UTF-16。日本語は1文字=1、絵文字は2)にする。
+    (UTF-8のバイト数で数えると、日本語が入った文ではアプリがリンクにしてくれなかった)"""
+    u16 = lambda t: len(t.encode("utf-16-le")) // 2  # noqa: E731
     out = []
     for m in re.finditer(r"https?://[^\s]+", text):
-        start = len(text[:m.start()].encode("utf-8"))
-        out.append((start, start + len(m.group(0).encode("utf-8")), "url"))
+        start = u16(text[:m.start()])
+        out.append((start, start + u16(m.group(0)), "url"))
     return out
 
 
