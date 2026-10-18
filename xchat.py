@@ -169,6 +169,71 @@ def conv_key(x, chat, conv):
     return bytes(keys[ver]), str(ver)
 
 
+UA = "Mozilla/5.0 (compatible; Twitterbot/1.0)"
+
+
+def og_info(url):
+    """リンク先のページから、プレビュー用の画像(og:image)とタイトル(og:title)を取る"""
+    r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "ja"}, timeout=30, allow_redirects=True)
+    html = r.text[:400000]
+
+    def meta(name):
+        for pat in (rf'<meta[^>]+(?:property|name)=["\']{name}["\'][^>]*content=["\']([^"\']+)',
+                    rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']{name}["\']'):
+            m = re.search(pat, html, re.I)
+            if m:
+                return m.group(1).replace("&amp;", "&").strip()
+        return ""
+
+    return meta("og:image") or meta("twitter:image"), meta("og:title") or meta("twitter:title")
+
+
+def upload_chat_media(x, conv, cipher):
+    """暗号化した画像を、その会話の保管場所にアップロードする → media_hash_key"""
+    c = conv.replace("-", ":")
+    d = x.post("/2/chat/media/upload/initialize", {"conversation_id": c, "total_bytes": len(cipher)}).get("data") or {}
+    sid, mkey = d.get("session_id") or d.get("sessionId"), d.get("media_hash_key") or d.get("mediaHashKey")
+    if not sid or not mkey:
+        raise RuntimeError("画像のアップロードを始められません")
+    n = 0
+    for off in range(0, len(cipher), 3 * 1024 * 1024):
+        x.post(f"/2/chat/media/upload/{sid}/append", {
+            "conversation_id": c, "media_hash_key": mkey, "segment_index": str(n),
+            "media": base64.b64encode(cipher[off:off + 3 * 1024 * 1024]).decode("ascii")})
+        n += 1
+    x.post(f"/2/chat/media/upload/{sid}/finalize", {"conversation_id": c, "media_hash_key": mkey, "num_parts": str(n)})
+    return str(mkey)
+
+
+def url_card(x, chat, conv, key, text):
+    """文の中のURLを、作品の画像つきのカード(押せるプレビュー)にする。作れなければ None"""
+    urls = re.findall(r"https?://\S+", text)
+    if not urls:
+        return None
+    url = urls[-1]
+    card = {"attachment_type": "url", "url": url}
+    try:
+        img_url, title = og_info(url)
+        if title:
+            card["display_title"] = title[:200]
+        if img_url:
+            img = requests.get(img_url, headers={"User-Agent": UA}, timeout=30).content
+            from chat_xdk import detect_image_dimensions, detect_mime_type
+            mime = str(detect_mime_type(img) or "")
+            if mime.startswith("image/") and len(img) < 5 * 1024 * 1024:
+                cipher = chat.encrypt_stream(img, key)
+                dims = detect_image_dimensions(img) or (1200, 630)
+                card["banner_image"] = {
+                    "media_hash_key": upload_chat_media(x, conv, cipher),
+                    "filesize_bytes": len(cipher),
+                    "filename": "banner." + ("png" if "png" in mime else "jpg"),
+                    "width": int(dims[0]), "height": int(dims[1]),
+                }
+    except Exception as e:  # noqa: BLE001
+        print(f"プレビュー画像は付けられませんでした({type(e).__name__})", flush=True)
+    return card
+
+
 def main():
     res = gas({"ar": "xc_jobs"})
     if not res.get("ok"):
@@ -209,7 +274,13 @@ def main():
     sent = 0
     for j in jobs:
         try:
-            p = chat.encrypt_message(conv, j["text"], conversation_key=key, conversation_key_version=kver)
+            card = url_card(x, chat, conv, key, j["text"])
+            try:
+                p = chat.encrypt_message(conv, j["text"], conversation_key=key, conversation_key_version=kver,
+                                         attachments=[card] if card else None)
+            except Exception:  # noqa: BLE001
+                # カードつきで暗号化できないときは、文だけで送る
+                p = chat.encrypt_message(conv, j["text"], conversation_key=key, conversation_key_version=kver)
             x.post(f"/2/chat/conversations/{conv}/messages", {
                 "message_id": p.message_id,
                 "encoded_message_create_event": p.encrypted_content,
