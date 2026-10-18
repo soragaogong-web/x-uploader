@@ -244,7 +244,10 @@ def url_card(x, chat, conv, key, text, note):
     except Exception as e:  # noqa: BLE001
         note.append(f"プレビュー画像のエラー: {type(e).__name__} {str(e)[:150]}")
     if note:
-        print("プレビュー画像は付けられませんでした", flush=True)
+        # 理由もログに出す(URLは伏せる)
+        print("プレビュー画像は付けられませんでした: " + re.sub(r"https?://\S+", "(URL)", " / ".join(note)), flush=True)
+    elif "banner_image" in card:
+        print("プレビュー画像つきのカードを付けました", flush=True)
     return card
 
 
