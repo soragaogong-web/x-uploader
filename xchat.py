@@ -171,6 +171,17 @@ def conv_key(x, chat, conv):
 
 
 UA = "Mozilla/5.0 (compatible; Twitterbot/1.0)"
+BROWSER_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
+              "(KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1")
+
+
+def to_jpeg(data):
+    from io import BytesIO
+    from PIL import Image
+    im = Image.open(BytesIO(data)).convert("RGB")
+    out = BytesIO()
+    im.save(out, "JPEG", quality=88)
+    return out.getvalue()
 
 
 def og_info(url):
@@ -224,10 +235,12 @@ def url_card(x, chat, conv, key, text, note):
         if not img_url:
             note.append("リンク先に作品の画像(og:image)が見つからない")
         else:
-            ir = requests.get(img_url, headers={"User-Agent": UA, "Referer": page}, timeout=30)
+            ir = requests.get(img_url, headers={"User-Agent": BROWSER_UA, "Referer": page}, timeout=30)
             img = ir.content
             from chat_xdk import detect_image_dimensions, detect_mime_type
             mime = str(detect_mime_type(img) or "")
+            if ir.status_code == 200 and mime.startswith("image/") and mime not in ("image/jpeg", "image/png"):
+                img, mime = to_jpeg(img), "image/jpeg"  # webp などは、アプリで確実に出るように JPEG に直す
             if ir.status_code != 200 or not mime.startswith("image/"):
                 note.append(f"作品の画像を取れない({ir.status_code} {mime or ir.headers.get('Content-Type', '')})")
             elif len(img) >= 5 * 1024 * 1024:
