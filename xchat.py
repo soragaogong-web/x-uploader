@@ -1,0 +1,229 @@
+"""
+X Chat(新しいチャット・暗号化つき)のグループへ送る係(GitHub Actions で動く)
+
+1. GAS の Web アプリ(?ar=xc_jobs)から「送る文」と OAuth 2.0 のトークン・鍵を受け取る
+2. 鍵を用意する(初回だけ、チャットのパスコードで鍵を取り出して GAS に保存してもらう)
+3. グループの会話の鍵を取り出し、Chat XDK で文を暗号化・署名して送る
+4. 結果を GAS に返す(?ar=xc_done / xc_fail)
+
+このリポジトリは公開なので、ログ(画面に出る文字)には
+トークン・鍵・パスコード・本文・会話IDを出さないようにしている。
+"""
+import base64
+import json
+import os
+import re
+import sys
+import time
+
+import requests
+from chat_xdk import Chat, guesses_remaining
+
+GAS_URL = os.environ["GAS_URL"]
+AR_KEY = os.environ["AR_KEY"]
+API = "https://api.x.com"
+
+
+def mask(value):
+    """GitHub のログに出ても伏せ字になるよう登録する"""
+    if value:
+        print(f"::add-mask::{value}", flush=True)
+
+
+def gas(params, tries=4):
+    """GAS とやりとりする。混んでいて変な返事が来たときは、少し待って何回かやり直す"""
+    params = dict(params, key=AR_KEY)
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(GAS_URL, params=params, timeout=120)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(5 * (i + 1))
+    raise RuntimeError(f"GASとの通信に失敗({params.get('ar')}): {str(last)[:120]}")
+
+
+class X:
+    """X API(OAuth 2.0 のトークンで呼ぶ)"""
+
+    def __init__(self, token):
+        self.h = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    def _check(self, r, what):
+        if r.status_code < 200 or r.status_code >= 300:
+            raise RuntimeError(f"{what}: {r.status_code} {r.text[:200]}")
+        return r.json() if r.text.strip() else {}
+
+    def get(self, path, params=None):
+        return self._check(requests.get(API + path, headers=self.h, params=params, timeout=60), "GET " + path.split("?")[0])
+
+    def post(self, path, body):
+        return self._check(requests.post(API + path, headers=self.h, json=body, timeout=60), "POST " + path.split("?")[0])
+
+
+def public_keys(x, user_id):
+    data = x.get(f"/2/users/{user_id}/public_keys").get("data") or []
+    return data if isinstance(data, list) else [data]
+
+
+def load_chat(x, res, uid):
+    """鍵を用意する。GAS に鍵があればそれを使い、無ければパスコードで取り出す"""
+    if res.get("keys"):
+        chat = Chat()
+        chat.import_keys(base64.b64decode(res["keys"]), version=res.get("ver") or None)
+        return chat, str(res.get("ver") or "1")
+    pin = res.get("pin")
+    if not pin:
+        raise RuntimeError("チャットのパスコードが未登録です(GASのメニュー「X Chat ③」)")
+    keys = public_keys(x, uid)
+    if not keys:
+        raise RuntimeError("このアカウントにはX Chatの鍵がまだありません(アプリでチャットを開いてパスコードを設定してください)")
+    latest = max(keys, key=lambda d: int(d.get("public_key_version") or 0))
+    cfg = latest.get("juicebox_config")
+    if not cfg:
+        raise RuntimeError("鍵の保管場所の情報(juicebox_config)が取れません")
+    ver = str(latest.get("public_key_version") or "1")
+    chat = Chat(json.dumps(cfg))
+    try:
+        chat.unlock(pin)
+    except Exception as e:  # noqa: BLE001
+        left = guesses_remaining(e)
+        gas({"ar": "xc_pinbad", "left": "" if left is None else str(left)})
+        raise RuntimeError(f"パスコードが違うか、鍵を取り出せません(残り回数: {left})")
+    blob = base64.b64encode(bytes(chat.export_keys())).decode("ascii")
+    mask(blob)
+    gas({"ar": "xc_keys", "keys": blob, "ver": ver})
+    print("パスコードで鍵を取り出しました", flush=True)
+    return chat, ver
+
+
+def find_conv(x, want):
+    """会話の一覧から、設定したグループ(g数字)を探す"""
+    digits = re.sub(r"\D", "", want or "")
+    data = x.get("/2/chat/conversations", {"max_results": 100}).get("data") or []
+    ids = [str(c.get("id") or c.get("conversation_id") or "").replace(":", "-") for c in data]
+    for cid in ids:
+        if digits and digits in cid:
+            return cid, ids
+    return (want or "").replace(":", "-"), ids
+
+
+def signing_keys_for(x, chat, user_ids):
+    out = []
+    for uid in user_ids:
+        try:
+            for pk in public_keys(x, uid):
+                identity = pk.get("public_key") or ""
+                signing = pk.get("signing_public_key") or ""
+                sig = pk.get("identity_public_key_signature") or ""
+                if identity and signing and sig and not chat.verify_key_binding(identity, signing, sig):
+                    continue
+                out.append({
+                    "user_id": str(uid),
+                    "public_key_version": str(pk.get("public_key_version") or ""),
+                    "public_key": signing,
+                    "identity_public_key": identity,
+                    "identity_public_key_signature": sig,
+                })
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def conv_key(x, chat, conv):
+    """グループの会話の鍵(いちばん新しいもの)を取り出す"""
+    key_events, encoded, senders, token = [], [], set(), None
+    for _ in range(5):
+        params = {"max_results": 100,
+                  "chat_message_event.fields": "conversation_id,created_at,encoded_event,id,sender_id"}
+        if token:
+            params["pagination_token"] = token
+        page = x.get(f"/2/chat/conversations/{conv}/events", params)
+        meta = page.get("meta") or {}
+        key_events += meta.get("conversation_key_events") or []
+        for e in page.get("data") or []:
+            if e.get("encoded_event"):
+                encoded.append(e["encoded_event"])
+            if e.get("sender_id"):
+                senders.add(str(e["sender_id"]))
+        token = meta.get("next_token")
+        if key_events or not token:
+            break
+    keys = {}
+    if key_events:
+        try:
+            keys = (chat.extract_conversation_keys(key_events) or {}).get("keys") or {}
+        except Exception:  # noqa: BLE001
+            keys = {}
+    if not keys and (key_events or encoded):
+        sk = signing_keys_for(x, chat, senders)
+        if sk:
+            chat.set_signing_keys(sk)
+        r = chat.decrypt_events(key_events + encoded, sk or None)
+        keys = ((r or {}).get("conversation_keys") or {}).get("keys") or {}
+    if not keys:
+        raise RuntimeError("グループの会話の鍵が見つかりません(@G_gayjp がグループに入っているか、アプリでグループを一度開いてみてください)")
+    ver = max(keys, key=lambda v: int(v) if str(v).isdigit() else 0)
+    return bytes(keys[ver]), str(ver)
+
+
+def main():
+    res = gas({"ar": "xc_jobs"})
+    if not res.get("ok"):
+        print("GASとの接続に失敗しました(GAS_URL / AR_KEY を確認)", flush=True)
+        sys.exit(1)
+    jobs = res.get("jobs") or []
+    if not jobs:
+        print("送るものはありません", flush=True)
+        return
+    for k in ("token", "keys", "pin"):
+        mask(res.get(k))
+    print(f"{len(jobs)}通を送ります", flush=True)
+
+    def fail_all(msg):
+        for j in jobs:
+            try:
+                gas({"ar": "xc_fail", "id": j["id"], "err": msg[:300]})
+            except Exception:  # noqa: BLE001
+                pass
+        print("失敗: 準備の段階でエラー(内容はスプレッドシートに書きました)", flush=True)
+        sys.exit(1)
+
+    if res.get("error") or not res.get("token"):
+        fail_all(res.get("error") or "トークンがありません")
+    x = X(res["token"])
+    try:
+        uid = str(x.get("/2/users/me")["data"]["id"])
+        chat, ver = load_chat(x, res, uid)
+        chat.set_identity(uid, ver)
+        conv, ids = find_conv(x, res.get("conv"))
+        if conv not in ids:
+            gas({"ar": "xc_info", "msg": f"会話の一覧にグループが見つかりません。見えている会話: {', '.join(ids[:15]) or 'なし'}"})
+        key, kver = conv_key(x, chat, conv)
+    except Exception as e:  # noqa: BLE001
+        fail_all(str(e))
+        return
+
+    sent = 0
+    for j in jobs:
+        try:
+            p = chat.encrypt_message(conv, j["text"], conversation_key=key, conversation_key_version=kver)
+            x.post(f"/2/chat/conversations/{conv}/messages", {
+                "message_id": p.message_id,
+                "encoded_message_create_event": p.encrypted_content,
+                "encoded_message_event_signature": p.encoded_event_signature,
+            })
+            gas({"ar": "xc_done", "id": j["id"]})
+            sent += 1
+            print(f"{sent}通目: 送信OK", flush=True)
+        except Exception as e:  # noqa: BLE001
+            gas({"ar": "xc_fail", "id": j["id"], "err": str(e)[:300]})
+            print("送信失敗(内容はスプレッドシートに書きました)", flush=True)
+        time.sleep(3)
+    print(f"おわり(送信 {sent}/{len(jobs)}通)", flush=True)
+
+
+if __name__ == "__main__":
+    main()

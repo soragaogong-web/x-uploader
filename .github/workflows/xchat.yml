@@ -1,0 +1,24 @@
+name: xchat
+
+on:
+  workflow_dispatch:
+
+# 同時に2つ動かない(あとから来た起動は、前の実行が終わるまで待つ)
+concurrency:
+  group: xchat
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install chatxdk requests
+      - run: python xchat.py
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+          AR_KEY: ${{ secrets.AR_KEY }}
