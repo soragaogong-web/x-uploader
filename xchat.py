@@ -248,6 +248,15 @@ def url_card(x, chat, conv, key, text, note):
     return card
 
 
+def url_entities(text):
+    """本文の中のURLに「ここはリンク」の印を付ける(位置はUTF-8のバイト数で数える: X Chat の決まり)"""
+    out = []
+    for m in re.finditer(r"https?://[^\s]+", text):
+        start = len(text[:m.start()].encode("utf-8"))
+        out.append((start, start + len(m.group(0).encode("utf-8")), "url"))
+    return out
+
+
 def main():
     res = gas({"ar": "xc_jobs"})
     if not res.get("ok"):
@@ -290,16 +299,18 @@ def main():
         try:
             note = []
             card = url_card(x, chat, conv, key, j["text"], note)
-            # カード(押せるプレビュー)を付けるときは、本文のURLの行は消す(二重に見えるため)
+            # 画像が付いたときだけカードにする(画像なしのカードは見た目が悪いので付けない)
+            if card and "banner_image" not in card:
+                card = None
             body = j["text"]
-            if card:
-                body = re.sub(r"[ \t]*" + re.escape(card["url"]) + r"[ \t]*", "", body).strip() or j["text"]
+            ents = url_entities(body)
             try:
                 p = chat.encrypt_message(conv, body, conversation_key=key, conversation_key_version=kver,
-                                         attachments=[card] if card else None)
+                                         entities=ents or None, attachments=[card] if card else None)
             except Exception:  # noqa: BLE001
                 # カードつきで暗号化できないときは、文だけで送る
-                p = chat.encrypt_message(conv, j["text"], conversation_key=key, conversation_key_version=kver)
+                p = chat.encrypt_message(conv, body, conversation_key=key, conversation_key_version=kver,
+                                         entities=ents or None)
             x.post(f"/2/chat/conversations/{conv}/messages", {
                 "message_id": p.message_id,
                 "encoded_message_create_event": p.encrypted_content,
