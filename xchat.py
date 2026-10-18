@@ -17,6 +17,7 @@ import sys
 import time
 
 import requests
+from urllib.parse import urljoin
 from chat_xdk import Chat, guesses_remaining
 
 GAS_URL = os.environ["GAS_URL"]
@@ -176,6 +177,7 @@ def og_info(url):
     """リンク先のページから、プレビュー用の画像(og:image)とタイトル(og:title)を取る"""
     r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "ja"}, timeout=30, allow_redirects=True)
     html = r.text[:400000]
+    base = r.url
 
     def meta(name):
         for pat in (rf'<meta[^>]+(?:property|name)=["\']{name}["\'][^>]*content=["\']([^"\']+)',
@@ -185,7 +187,10 @@ def og_info(url):
                 return m.group(1).replace("&amp;", "&").strip()
         return ""
 
-    return meta("og:image") or meta("twitter:image"), meta("og:title") or meta("twitter:title")
+    img = meta("og:image") or meta("twitter:image")
+    if img:
+        img = urljoin(base, img)  # 「/images/…」のような書き方にも対応
+    return img, meta("og:title") or meta("twitter:title"), base
 
 
 def upload_chat_media(x, conv, cipher):
@@ -205,7 +210,7 @@ def upload_chat_media(x, conv, cipher):
     return str(mkey)
 
 
-def url_card(x, chat, conv, key, text):
+def url_card(x, chat, conv, key, text, note):
     """文の中のURLを、作品の画像つきのカード(押せるプレビュー)にする。作れなければ None"""
     urls = re.findall(r"https?://\S+", text)
     if not urls:
@@ -213,14 +218,21 @@ def url_card(x, chat, conv, key, text):
     url = urls[-1]
     card = {"attachment_type": "url", "url": url}
     try:
-        img_url, title = og_info(url)
+        img_url, title, page = og_info(url)
         if title:
             card["display_title"] = title[:200]
-        if img_url:
-            img = requests.get(img_url, headers={"User-Agent": UA}, timeout=30).content
+        if not img_url:
+            note.append("リンク先に作品の画像(og:image)が見つからない")
+        else:
+            ir = requests.get(img_url, headers={"User-Agent": UA, "Referer": page}, timeout=30)
+            img = ir.content
             from chat_xdk import detect_image_dimensions, detect_mime_type
             mime = str(detect_mime_type(img) or "")
-            if mime.startswith("image/") and len(img) < 5 * 1024 * 1024:
+            if ir.status_code != 200 or not mime.startswith("image/"):
+                note.append(f"作品の画像を取れない({ir.status_code} {mime or ir.headers.get('Content-Type', '')})")
+            elif len(img) >= 5 * 1024 * 1024:
+                note.append("作品の画像が大きすぎる")
+            else:
                 cipher = chat.encrypt_stream(img, key)
                 dims = detect_image_dimensions(img) or (1200, 630)
                 card["banner_image"] = {
@@ -230,7 +242,9 @@ def url_card(x, chat, conv, key, text):
                     "width": int(dims[0]), "height": int(dims[1]),
                 }
     except Exception as e:  # noqa: BLE001
-        print(f"プレビュー画像は付けられませんでした({type(e).__name__})", flush=True)
+        note.append(f"プレビュー画像のエラー: {type(e).__name__} {str(e)[:150]}")
+    if note:
+        print("プレビュー画像は付けられませんでした", flush=True)
     return card
 
 
@@ -274,9 +288,14 @@ def main():
     sent = 0
     for j in jobs:
         try:
-            card = url_card(x, chat, conv, key, j["text"])
+            note = []
+            card = url_card(x, chat, conv, key, j["text"], note)
+            # カード(押せるプレビュー)を付けるときは、本文のURLの行は消す(二重に見えるため)
+            body = j["text"]
+            if card:
+                body = re.sub(r"[ \t]*" + re.escape(card["url"]) + r"[ \t]*", "", body).strip() or j["text"]
             try:
-                p = chat.encrypt_message(conv, j["text"], conversation_key=key, conversation_key_version=kver,
+                p = chat.encrypt_message(conv, body, conversation_key=key, conversation_key_version=kver,
                                          attachments=[card] if card else None)
             except Exception:  # noqa: BLE001
                 # カードつきで暗号化できないときは、文だけで送る
@@ -286,7 +305,7 @@ def main():
                 "encoded_message_create_event": p.encrypted_content,
                 "encoded_message_event_signature": p.encoded_event_signature,
             })
-            gas({"ar": "xc_done", "id": j["id"]})
+            gas({"ar": "xc_done", "id": j["id"], "note": ("プレビュー画像なし: " + " / ".join(note))[:300] if note else ""})
             sent += 1
             print(f"{sent}通目: 送信OK", flush=True)
         except Exception as e:  # noqa: BLE001
