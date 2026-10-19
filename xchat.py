@@ -301,47 +301,70 @@ def main():
     if res.get("error") or not res.get("token"):
         fail_all(res.get("error") or "トークンがありません")
     x = X(res["token"])
+    wants = res.get("convs") or ([res["conv"]] if res.get("conv") else [])
+    if not wants:
+        fail_all("送り先グループが設定されていません")
     try:
         uid = str(x.get("/2/users/me")["data"]["id"])
         chat, ver = load_chat(x, res, uid)
         chat.set_identity(uid, ver)
-        conv, ids = find_conv(x, res.get("conv"))
-        if conv not in ids:
-            gas({"ar": "xc_info", "msg": f"会話の一覧にグループが見つかりません。見えている会話: {', '.join(ids[:15]) or 'なし'}"})
-        key, kver = conv_key(x, chat, conv)
     except Exception as e:  # noqa: BLE001
         fail_all(str(e))
         return
 
+    # 送り先グループごとに、会話IDと会話の鍵を用意する(複数のグループに同じ文を送る)
+    groups, prep_err = [], []
+    for n, want in enumerate(wants, 1):
+        try:
+            conv, ids = find_conv(x, want)
+            if conv not in ids:
+                gas({"ar": "xc_info", "msg": f"{n}つ目のグループが会話の一覧に見つかりません。見えている会話: {', '.join(ids[:15]) or 'なし'}"})
+            key, kver = conv_key(x, chat, conv)
+            groups.append((n, conv, key, kver))
+        except Exception as e:  # noqa: BLE001
+            prep_err.append(f"{n}つ目のグループ: {str(e)[:150]}")
+    if not groups:
+        fail_all(" / ".join(prep_err))
+        return
+
     sent = 0
     for j in jobs:
-        try:
-            note = []
-            card = url_card(x, chat, conv, key, j["text"], note)
-            # 画像が付いたときだけカードにする(画像なしのカードは見た目が悪いので付けない)
-            if card and "banner_image" not in card:
-                card = None
-            body = j["text"]
-            ents = url_entities(body)
+        ok, errs, notes = 0, list(prep_err), []
+        body = j["text"]
+        ents = url_entities(body)
+        for n, conv, key, kver in groups:
             try:
-                p = chat.encrypt_message(conv, body, conversation_key=key, conversation_key_version=kver,
-                                         entities=ents or None, attachments=[card] if card else None)
-            except Exception:  # noqa: BLE001
-                # カードつきで暗号化できないときは、文だけで送る
-                p = chat.encrypt_message(conv, body, conversation_key=key, conversation_key_version=kver,
-                                         entities=ents or None)
-            x.post(f"/2/chat/conversations/{conv}/messages", {
-                "message_id": p.message_id,
-                "encoded_message_create_event": p.encrypted_content,
-                "encoded_message_event_signature": p.encoded_event_signature,
-            })
-            gas({"ar": "xc_done", "id": j["id"], "note": ("プレビュー画像なし: " + " / ".join(note))[:300] if note else ""})
+                note = []
+                card = url_card(x, chat, conv, key, body, note)  # 画像はグループごとに暗号化してアップロード
+                # 画像が付いたときだけカードにする(画像なしのカードは見た目が悪いので付けない)
+                if card and "banner_image" not in card:
+                    card = None
+                try:
+                    p = chat.encrypt_message(conv, body, conversation_key=key, conversation_key_version=kver,
+                                             entities=ents or None, attachments=[card] if card else None)
+                except Exception:  # noqa: BLE001
+                    # カードつきで暗号化できないときは、文だけで送る
+                    p = chat.encrypt_message(conv, body, conversation_key=key, conversation_key_version=kver,
+                                             entities=ents or None)
+                x.post(f"/2/chat/conversations/{conv}/messages", {
+                    "message_id": p.message_id,
+                    "encoded_message_create_event": p.encrypted_content,
+                    "encoded_message_event_signature": p.encoded_event_signature,
+                })
+                ok += 1
+                if note and not notes:
+                    notes.append("プレビュー画像なし: " + " / ".join(note))
+                print(f"{n}つ目のグループ: 送信OK", flush=True)
+            except Exception as e:  # noqa: BLE001
+                errs.append(f"{n}つ目のグループで失敗: {str(e)[:150]}")
+                print(f"{n}つ目のグループ: 送信失敗(内容はスプレッドシートに書きました)", flush=True)
+            time.sleep(2)
+        if ok:
+            gas({"ar": "xc_done", "id": j["id"], "note": " / ".join(errs + notes)[:300]})
             sent += 1
-            print(f"{sent}通目: 送信OK", flush=True)
-        except Exception as e:  # noqa: BLE001
-            gas({"ar": "xc_fail", "id": j["id"], "err": str(e)[:300]})
-            print("送信失敗(内容はスプレッドシートに書きました)", flush=True)
-        time.sleep(3)
+        else:
+            gas({"ar": "xc_fail", "id": j["id"], "err": " / ".join(errs)[:300]})
+        time.sleep(2)
     print(f"おわり(送信 {sent}/{len(jobs)}通)", flush=True)
 
 
