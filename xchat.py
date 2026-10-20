@@ -276,63 +276,63 @@ def url_entities(text):
     return out
 
 
-def main():
-    res = gas({"ar": "xc_jobs"})
-    if not res.get("ok"):
-        print("GASとの接続に失敗しました(GAS_URL / AR_KEY を確認)", flush=True)
-        sys.exit(1)
-    jobs = res.get("jobs") or []
-    if not jobs:
-        print("送るものはありません", flush=True)
-        return
-    for k in ("token", "keys", "pin"):
-        mask(res.get(k))
-    print(f"{len(jobs)}通を送ります", flush=True)
+RUN_LIMIT_SEC = 50 * 60      # 1回の起動で動く最長時間(GitHub の上限より短く)
+IDLE_LIMIT_SEC = 8 * 60      # 予定がこの時間なかったら終わる
+POLL_SEC = 60                # GAS に新しい予定を聞きに行く間隔
+CLAIM_AHEAD_SEC = 10 * 60    # この先何秒以内に送る予定を受け取るか
 
-    def fail_all(msg):
-        for j in jobs:
+
+class Sender:
+    """鍵と送り先グループを1回だけ用意して、予定を順番に送る"""
+
+    def __init__(self):
+        self.ready = False
+        self.x = None
+        self.chat = None
+        self.groups = []
+        self.prep_err = []
+
+    def set_token(self, token):
+        if token:
+            mask(token)
+            if self.x:
+                self.x.h["Authorization"] = f"Bearer {token}"
+            else:
+                self.x = X(token)
+
+    def prepare(self, res):
+        """初めて予定を受け取ったときに、鍵と各グループの会話の鍵を用意する"""
+        for k in ("keys", "pin"):
+            mask(res.get(k))
+        self.set_token(res.get("token"))
+        if res.get("error") or not self.x:
+            raise RuntimeError(res.get("error") or "トークンがありません")
+        wants = res.get("convs") or ([res["conv"]] if res.get("conv") else [])
+        if not wants:
+            raise RuntimeError("送り先グループが設定されていません")
+        uid = str(self.x.get("/2/users/me")["data"]["id"])
+        self.chat, ver = load_chat(self.x, res, uid)
+        self.chat.set_identity(uid, ver)
+        for n, want in enumerate(wants, 1):
             try:
-                gas({"ar": "xc_fail", "id": j["id"], "err": msg[:300]})
-            except Exception:  # noqa: BLE001
-                pass
-        print("失敗: 準備の段階でエラー(内容はスプレッドシートに書きました)", flush=True)
-        sys.exit(1)
+                conv, ids = find_conv(self.x, want)
+                if conv not in ids:
+                    gas({"ar": "xc_info", "msg": f"{n}つ目のグループが会話の一覧に見つかりません。見えている会話: {', '.join(ids[:15]) or 'なし'}"})
+                key, kver = conv_key(self.x, self.chat, conv)
+                self.groups.append((n, conv, key, kver))
+            except Exception as e:  # noqa: BLE001
+                self.prep_err.append(f"{n}つ目のグループ: {str(e)[:150]}")
+        if not self.groups:
+            raise RuntimeError(" / ".join(self.prep_err))
+        self.ready = True
 
-    if res.get("error") or not res.get("token"):
-        fail_all(res.get("error") or "トークンがありません")
-    x = X(res["token"])
-    wants = res.get("convs") or ([res["conv"]] if res.get("conv") else [])
-    if not wants:
-        fail_all("送り先グループが設定されていません")
-    try:
-        uid = str(x.get("/2/users/me")["data"]["id"])
-        chat, ver = load_chat(x, res, uid)
-        chat.set_identity(uid, ver)
-    except Exception as e:  # noqa: BLE001
-        fail_all(str(e))
-        return
-
-    # 送り先グループごとに、会話IDと会話の鍵を用意する(複数のグループに同じ文を送る)
-    groups, prep_err = [], []
-    for n, want in enumerate(wants, 1):
-        try:
-            conv, ids = find_conv(x, want)
-            if conv not in ids:
-                gas({"ar": "xc_info", "msg": f"{n}つ目のグループが会話の一覧に見つかりません。見えている会話: {', '.join(ids[:15]) or 'なし'}"})
-            key, kver = conv_key(x, chat, conv)
-            groups.append((n, conv, key, kver))
-        except Exception as e:  # noqa: BLE001
-            prep_err.append(f"{n}つ目のグループ: {str(e)[:150]}")
-    if not groups:
-        fail_all(" / ".join(prep_err))
-        return
-
-    sent = 0
-    for j in jobs:
-        ok, errs, notes = 0, list(prep_err), []
+    def send(self, j):
+        """1通を、全部の送り先グループに送って、結果を GAS に返す"""
+        x, chat = self.x, self.chat
+        ok, errs, notes = 0, list(self.prep_err), []
         body = j["text"]
         ents = url_entities(body)
-        for n, conv, key, kver in groups:
+        for n, conv, key, kver in self.groups:
             try:
                 note = []
                 card = url_card(x, chat, conv, key, body, note)  # 画像はグループごとに暗号化してアップロード
@@ -361,11 +361,71 @@ def main():
             time.sleep(2)
         if ok:
             gas({"ar": "xc_done", "id": j["id"], "note": " / ".join(errs + notes)[:300]})
-            sent += 1
         else:
             gas({"ar": "xc_fail", "id": j["id"], "err": " / ".join(errs)[:300]})
-        time.sleep(2)
-    print(f"おわり(送信 {sent}/{len(jobs)}通)", flush=True)
+        return ok > 0
+
+
+def main():
+    started = time.time()
+    sender = Sender()
+    queue = []          # 受け取った予定(送る時刻の順)
+    last_poll = 0
+    last_job = time.time()
+    sent = 0
+    while True:
+        now = time.time()
+        # 1) GAS に新しい予定を聞く(終わる時刻までに送れる分だけ受け取る)
+        if now - last_poll >= POLL_SEC and now - started < RUN_LIMIT_SEC - 60:
+            last_poll = now
+            until = min(now + CLAIM_AHEAD_SEC, started + RUN_LIMIT_SEC - 60)
+            try:
+                res = gas({"ar": "xc_jobs", "until": str(int(until * 1000))})
+            except Exception as e:  # noqa: BLE001
+                print(f"GASに聞けませんでした: {str(e)[:80]}", flush=True)
+                res = {"ok": True, "jobs": []}
+            if not res.get("ok"):
+                print("GASとの接続に失敗しました(GAS_URL / AR_KEY を確認)", flush=True)
+                sys.exit(1)
+            jobs = res.get("jobs") or []
+            if jobs and not sender.ready:
+                try:
+                    sender.prepare(res)
+                except Exception as e:  # noqa: BLE001
+                    for j in jobs:
+                        try:
+                            gas({"ar": "xc_fail", "id": j["id"], "err": str(e)[:300]})
+                        except Exception:  # noqa: BLE001
+                            pass
+                    print("失敗: 準備の段階でエラー(内容はスプレッドシートに書きました)", flush=True)
+                    sys.exit(1)
+            else:
+                sender.set_token(res.get("token"))
+            if jobs:
+                queue.extend(jobs)
+                queue.sort(key=lambda j: j.get("sendAt") or 0)
+                last_job = now
+                print(f"{len(jobs)}通の予定を受け取りました(待ち {len(queue)}通)", flush=True)
+        # 2) 時刻が来た予定を送る
+        while queue and (queue[0].get("sendAt") or 0) / 1000 <= time.time():
+            j = queue.pop(0)
+            try:
+                if sender.send(j):
+                    sent += 1
+            except Exception as e:  # noqa: BLE001
+                gas({"ar": "xc_fail", "id": j["id"], "err": str(e)[:300]})
+            last_job = time.time()
+        # 3) 終わるかどうか
+        now = time.time()
+        if not queue and (now - last_job > IDLE_LIMIT_SEC or now - started > RUN_LIMIT_SEC - 60):
+            break
+        if queue and now - started > RUN_LIMIT_SEC:
+            break  # 送り切れなかった分は、GAS が時間切れで待ちに戻す
+        wait = POLL_SEC - (now - last_poll)
+        if queue:
+            wait = min(wait, (queue[0].get("sendAt") or 0) / 1000 - now)
+        time.sleep(max(1, min(30, wait)))
+    print(f"おわり(送信 {sent}通)", flush=True)
 
 
 if __name__ == "__main__":
