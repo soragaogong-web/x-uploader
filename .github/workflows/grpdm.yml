@@ -1,0 +1,27 @@
+name: grpdm
+
+on:
+  workflow_dispatch:
+
+# 同時に2つ動かない(あとから来た起動は、前の実行が終わるまで待つ)
+concurrency:
+  group: grpdm
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # chatxdk は 0.6 で使い方が大きく変わるので、動作を確かめた版に固定
+      - run: pip install chatxdk==0.5.2 requests pillow
+      # 動画の幅・高さ・長さを調べる道具(無いときだけ入れる)
+      - run: which ffprobe || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+      - run: python grpdm.py
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+          AR_KEY: ${{ secrets.AR_KEY }}
