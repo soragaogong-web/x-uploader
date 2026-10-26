@@ -188,8 +188,9 @@ def send(acct, j, drive_token):
         atts.append(att)
     text = j.get("text") or ""
     ents = url_entities(text)
+    ttl = int(j.get("ttl") or 0)  # 消えるまでの時間(ミリ秒)。0 = 消えない
     p = acct.chat.encrypt_message(conv, text, conversation_key=key, conversation_key_version=kver,
-                                  entities=ents or None, attachments=atts or None)
+                                  entities=ents or None, attachments=atts or None, ttl_msec=ttl or None)
     acct.x.post(f"/2/chat/conversations/{conv}/messages", {
         "message_id": p.message_id,
         "encoded_message_create_event": p.encrypted_content,
