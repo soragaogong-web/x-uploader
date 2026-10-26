@@ -12,6 +12,7 @@ DMグループ定期送信(複数アカウント × 複数グループ)の送信
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -147,19 +148,25 @@ class Media:
 
 
 def video_info(data):
-    """動画の幅・高さ・長さ(ミリ秒)を ffprobe で調べる。調べられなければ仮の値"""
-    if not shutil.which("ffprobe"):
-        return 1280, 720, 0
+    """動画の幅・高さ・長さ(ミリ秒)を調べる。ffprobe が無ければ pip の ffmpeg(imageio-ffmpeg)で調べる。だめなら仮の値"""
     with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
         f.write(data)
         f.flush()
         try:
-            out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                                  "-show_entries", "stream=width,height:format=duration", "-of", "json", f.name],
-                                 capture_output=True, text=True, timeout=120).stdout
-            j = json.loads(out or "{}")
-            st = (j.get("streams") or [{}])[0]
-            return int(st.get("width") or 1280), int(st.get("height") or 720), int(float((j.get("format") or {}).get("duration") or 0) * 1000)
+            if shutil.which("ffprobe"):
+                out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                      "-show_entries", "stream=width,height:format=duration", "-of", "json", f.name],
+                                     capture_output=True, text=True, timeout=60).stdout
+                j = json.loads(out or "{}")
+                st = (j.get("streams") or [{}])[0]
+                return int(st.get("width") or 1280), int(st.get("height") or 720), int(float((j.get("format") or {}).get("duration") or 0) * 1000)
+            import imageio_ffmpeg
+            err = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", f.name],
+                                 capture_output=True, text=True, timeout=60).stderr
+            d = re.search(r"Duration: (\d+):(\d+):([\d.]+)", err)
+            wh = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", err)
+            ms = int((int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3))) * 1000) if d else 0
+            return (int(wh.group(1)), int(wh.group(2)), ms) if wh else (1280, 720, ms)
         except Exception:  # noqa: BLE001
             return 1280, 720, 0
 

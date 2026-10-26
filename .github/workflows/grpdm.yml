@@ -18,9 +18,9 @@ jobs:
         with:
           python-version: "3.11"
       # chatxdk は 0.6 で使い方が大きく変わるので、動作を確かめた版に固定
-      - run: pip install chatxdk==0.5.2 requests pillow
-      # 動画の幅・高さ・長さを調べる道具(無いときだけ入れる)
-      - run: which ffprobe || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+      # imageio-ffmpeg: 動画の幅・高さ・長さを調べる道具(apt で入れると止まることがあったので pip で入れる)
+      - run: pip install chatxdk==0.5.2 requests pillow imageio-ffmpeg
+        timeout-minutes: 5
       - run: python grpdm.py
         env:
           GAS_URL: ${{ secrets.GAS_URL }}
