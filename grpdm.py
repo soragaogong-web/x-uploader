@@ -228,7 +228,11 @@ def main():
                 if name not in accounts:
                     accounts[name] = Account(name, len(accounts) + 1)
                 accounts[name].set_token(info.get("token"))
-                accounts[name].info = info
+                # 前に受け取った鍵・パスコードは残したまま、新しい情報(トークンなど)だけ上書きする
+                # (待っている間の問い合わせの返事には鍵・パスコードが入っていないので、丸ごと置き換えると消えてしまう)
+                accounts[name].info.update({k: v for k, v in info.items() if v not in (None, "")})
+                if info.get("token") and not info.get("error"):
+                    accounts[name].info.pop("error", None)  # 前のエラーが直っていれば消す
             jobs = res.get("jobs") or []
             if jobs:
                 queue.extend(jobs)
