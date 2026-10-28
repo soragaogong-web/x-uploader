@@ -94,7 +94,8 @@ function onOpen() {
     .addItem('1時間ごとの自動実行をON', 'installTrigger')
     .addItem('自動実行をOFF', 'removeTrigger')
     .addSeparator()
-    .addItem('人気ポスト（画像・動画なし）をCSVにする', 'popularToCsv')
+    .addItem('人気ポスト：シートのアカウントをまとめてCSVにする', 'popularRunSheet')
+    .addItem('人気ポスト：1アカウントだけCSVにする', 'popularToCsv')
     .addSeparator()
     .addSubMenu(SpreadsheetApp.getUi().createMenu('大きい動画（50MB超）')
       .addItem('① GitHub連携を登録', 'bigSaveGithub')
@@ -103,7 +104,7 @@ function onOpen() {
       .addItem('待ちの動画を今すぐ保存する', 'bigDispatchNow')
       .addItem('失敗した動画をやり直す', 'bigRetryFailed'))
     .addToUi();
-  try { ensureSettingsSheet_(); } catch (e) { /* 権限前などは「初期設定」で作られる */ }
+  try { ensureSettingsSheet_(); popularSheet_(); } catch (e) { /* 権限前などは「初期設定」で作られる */ }
 }
 
 /* ===================== 設定シート ===================== */
@@ -895,20 +896,111 @@ function bigWeb_(p) {
 
 /* ===================== 人気ポスト（画像・動画なし）を CSV にする ===================== */
 /*
- * メニュー「人気ポスト（画像・動画なし）をCSVにする」→ アカウント名と抽出数を入れる
- *   1. X の全期間検索で「from:アカウント -has:media」（画像・動画なし、リポスト・返信は除く）を取得
+ * ■「人気ポスト」シート（アカウント一覧）
+ *   A列: Xのアカウント名（@なし）
+ *   B列: 抽出数 … 空なら設定シートの「人気ポスト：抽出数」（初期値130）
+ *   C列: ☑ … チェックした行だけ、メニュー「人気ポスト：シートのアカウントをまとめてCSVにする」で処理する
+ *        終わった行はチェックが自動で外れる（うっかり2回実行して料金がかからないように）
+ *   D〜G列: 状態・CSVのリンク・読み込んだ投稿数・最終実行（自動で入る）
+ * ■ しくみ
+ *   1. X の全期間検索で「from:アカウント -has:media -is:retweet -is:reply」を取得
  *      ふだんは X の人気順（関連性の高い順）で「抽出数×倍率」件を読む
  *      設定「直近の投稿を全部調べる」がONなら、新しい順に指定件数を読む
  *   2. 読んだ中をいいね数の多い順に並べ、上位を CSV にしてドライブの「人気ポストCSV」フォルダに保存
- *   3.「人気ポスト」シートに実行記録とCSVのリンクを残す
+ *   3. 実行の履歴は「人気ポスト_記録」シートに残る
  */
 
 const POP = {
   SHEET: '人気ポスト',
-  HEADER: ['実行日時', 'account', '抽出数', '読み込んだ投稿数', '方式', 'CSV', 'メモ'],
+  HEADER: ['account（@なし）', '抽出数（空なら設定値）', 'CSVにする', '状態', 'CSV', '読み込んだ投稿数', '最終実行'],
+  LOG: '人気ポスト_記録',
+  LOG_HEADER: ['実行日時', 'account', '抽出数', '読み込んだ投稿数', '方式', 'CSV', 'メモ'],
   FOLDER: '人気ポストCSV',
 };
 
+/** 「人気ポスト」シートを用意する（前の版の記録シートだった場合は「人気ポスト_記録」に名前を変えて残す） */
+function popularSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(POP.SHEET);
+  if (sh && sh.getRange(1, 1).getValue() !== POP.HEADER[0]) {
+    if (!ss.getSheetByName(POP.LOG)) sh.setName(POP.LOG);
+    else sh.setName(POP.LOG + '_旧');
+    sh = null;
+  }
+  if (!sh) {
+    sh = ss.insertSheet(POP.SHEET);
+    sh.appendRow(POP.HEADER);
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, 1, POP.HEADER.length).setFontWeight('bold');
+    sh.getRange(2, 3, 200, 1).insertCheckboxes();
+    sh.setColumnWidth(1, 180);
+    sh.setColumnWidth(4, 260);
+  }
+  return sh;
+}
+
+function popularReadMax_(count) {
+  return CONFIG.POPULAR_FULL_SCAN
+    ? Math.max(count, CONFIG.POPULAR_SCAN_MAX || 1000)
+    : Math.ceil(count * Math.max(1, CONFIG.POPULAR_MULTIPLIER || 2));
+}
+
+/** メニュー：シートのチェックした行をまとめて CSV にする */
+function popularRunSheet() {
+  loadSettings_();
+  const ui = SpreadsheetApp.getUi();
+  const token = getBearerToken_();
+  if (!token) { ui.alert('スクリプト プロパティ X_BEARER_TOKEN が未設定です。'); return; }
+
+  const sh = popularSheet_();
+  const last = sh.getLastRow();
+  const def = CONFIG.POPULAR_COUNT || 130;
+  const rows = [];
+  if (last > 1) {
+    sh.getRange(2, 1, last - 1, 3).getValues().forEach((r, i) => {
+      const name = normName_(r[0]);
+      if (!name || r[2] !== true) return;
+      const n = parseInt(r[1], 10);
+      rows.push({ row: i + 2, name, count: n > 0 ? n : def });
+    });
+  }
+  if (!rows.length) {
+    ui.alert('「人気ポスト」シートで、A列にアカウント名を書いてC列にチェックを入れてから実行してください。');
+    sh.activate();
+    return;
+  }
+
+  const bad = rows.filter(r => !/^\w{1,15}$/.test(r.name));
+  if (bad.length) { ui.alert('アカウント名の形が違う行があります（英数字と _ だけ、15文字まで）: ' + bad.map(b => b.name).join(', ')); return; }
+
+  const totalRead = rows.reduce((a, r) => a + popularReadMax_(r.count), 0);
+  const ok = ui.alert('確認',
+    `${rows.length}アカウントの人気ポストをCSVにします。\n` +
+    rows.map(r => `・@${r.name}：${r.count}件（最大${popularReadMax_(r.count)}件読む）`).join('\n') +
+    `\n\n方式：${CONFIG.POPULAR_FULL_SCAN ? '直近の投稿を全部調べる' : 'Xの人気順で多めに読む'}\n` +
+    `X APIの料金の目安：最大 約${(totalRead * 0.005).toFixed(2)}ドル\n\n実行しますか？`,
+    ui.ButtonSet.OK_CANCEL);
+  if (ok !== ui.Button.OK) return;
+
+  const deadline = Date.now() + CONFIG.MAX_RUNTIME_MS;
+  let done = 0, failed = 0, left = 0;
+  for (const r of rows) {
+    if (Date.now() > deadline) {
+      sh.getRange(r.row, 4).setValue('時間切れ。もう一度実行すると続きから');
+      left++;
+      continue;
+    }
+    sh.getRange(r.row, 4).setValue('実行中…');
+    SpreadsheetApp.flush();
+    const res = popularRunOne_(token, r.name, r.count);
+    sh.getRange(r.row, 4, 1, 4).setValues([[res.msg, res.url || '', res.read, new Date()]]);
+    if (res.ok) { sh.getRange(r.row, 3).setValue(false); done++; } else failed++;
+  }
+  ui.alert(`完了：${done}件` + (failed ? ` / 失敗・該当なし：${failed}件` : '') + (left ? ` / 時間切れ：${left}件（もう一度実行してください）` : '') +
+    '\nCSVはドライブの「人気ポストCSV」フォルダに保存されています。');
+}
+
+/** メニュー：1アカウントだけ入力して CSV にする */
 function popularToCsv() {
   loadSettings_();
   const ui = SpreadsheetApp.getUi();
@@ -926,41 +1018,43 @@ function popularToCsv() {
   const count = parseInt(r2.getResponseText().trim() || def, 10);
   if (!(count > 0)) { ui.alert('抽出数は1以上の数字で入力してください。'); return; }
 
-  const full = CONFIG.POPULAR_FULL_SCAN;
-  const readMax = full
-    ? Math.max(count, CONFIG.POPULAR_SCAN_MAX || 1000)
-    : Math.ceil(count * Math.max(1, CONFIG.POPULAR_MULTIPLIER || 2));
-  const cost = (readMax * 0.005).toFixed(2);
+  const readMax = popularReadMax_(count);
   const ok = ui.alert('確認',
     `@${name} の画像・動画なしのポストを最大 ${readMax} 件読み込み、いいね数の多い順に ${count} 件をCSVにします。\n` +
-    `方式：${full ? '直近の投稿を全部調べる' : 'Xの人気順で多めに読む'}\nX APIの料金の目安：最大 約${cost}ドル\n\n実行しますか？`,
+    `方式：${CONFIG.POPULAR_FULL_SCAN ? '直近の投稿を全部調べる' : 'Xの人気順で多めに読む'}\nX APIの料金の目安：最大 約${(readMax * 0.005).toFixed(2)}ドル\n\n実行しますか？`,
     ui.ButtonSet.OK_CANCEL);
   if (ok !== ui.Button.OK) return;
 
-  let msg;
+  const res = popularRunOne_(token, name, count);
+  if (!res.ok) { ui.alert(res.msg); return; }
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  ui.showModalDialog(HtmlService.createHtmlOutput(
+    '<div style="font-family:sans-serif;font-size:14px;line-height:1.7">' +
+    `<p>${esc(res.msg)}</p><p><a href="${esc(res.url)}" target="_blank">${esc(res.fileName)} を開く</a></p>` +
+    '<p style="color:#666">ドライブの「人気ポストCSV」フォルダに保存されています。</p></div>'
+  ).setWidth(480).setHeight(200), '完了');
+}
+
+/** 1アカウント分を処理。戻り値 { ok, msg, url, fileName, read } */
+function popularRunOne_(token, name, count) {
+  const full = CONFIG.POPULAR_FULL_SCAN;
   try {
-    const posts = popularFetch_(token, name, readMax, full);
+    const posts = popularFetch_(token, name, popularReadMax_(count), full);
     const top = posts.filter(p => !p.hasMedia)
       .sort((a, b) => b.likes - a.likes || b.reposts - a.reposts)
       .slice(0, count);
     if (!top.length) {
-      popularLog_(name, count, posts.length, full, '', '該当するポストがありません');
-      ui.alert(`@${name} の画像・動画なしのポストが見つかりませんでした（鍵アカウント・アカウント名の間違い・投稿なしの可能性）。`);
-      return;
+      popularLog_(name, count, posts.length, full, '', '該当なし');
+      return { ok: false, read: posts.length,
+        msg: '該当するポストなし（鍵アカウント・名前の間違い・画像なしの投稿がない可能性）' };
     }
     const file = popularSaveCsv_(name, top);
-    msg = top.length < count ? `${count}件に届かず${top.length}件` : '';
-    popularLog_(name, count, posts.length, full, file.getUrl(), msg);
-    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
-    SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(
-      '<div style="font-family:sans-serif;font-size:14px;line-height:1.7">' +
-      `<p>@${esc(name)} の人気ポスト ${top.length} 件をCSVにしました（読み込み ${posts.length} 件）。</p>` +
-      `<p><a href="${esc(file.getUrl())}" target="_blank">${esc(file.getName())} を開く</a></p>` +
-      '<p style="color:#666">ドライブの「人気ポストCSV」フォルダに保存されています。「人気ポスト」シートにも記録があります。</p></div>'
-    ).setWidth(480).setHeight(220), '完了');
+    const msg = `完了：${top.length}件をCSVにしました` + (top.length < count ? `（${count}件に届かず）` : '');
+    popularLog_(name, count, posts.length, full, file.getUrl(), top.length < count ? `${count}件に届かず` : '');
+    return { ok: true, msg, url: file.getUrl(), fileName: file.getName(), read: posts.length };
   } catch (e) {
     popularLog_(name, count, 0, full, '', 'エラー: ' + e.message);
-    ui.alert('エラー: ' + e.message);
+    return { ok: false, read: 0, msg: 'エラー: ' + e.message };
   }
 }
 
@@ -1022,6 +1116,7 @@ function popularSaveCsv_(name, top) {
 }
 
 function popularLog_(name, count, read, full, url, memo) {
-  getSheet_(POP.SHEET, POP.HEADER).appendRow([new Date(), name, count, read,
+  popularSheet_(); // 前の版の記録シートがあれば先に名前を変えておく
+  getSheet_(POP.LOG, POP.LOG_HEADER).appendRow([new Date(), name, count, read,
     full ? '直近を全部調べる' : 'Xの人気順で多めに読む', url, memo || '']);
 }
