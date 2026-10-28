@@ -61,8 +61,8 @@ const SETTINGS_DEF = [
     '空ならマイドライブ直下。まとめたいフォルダがあれば、そのURLの folders/ の後ろの部分を貼る'],
   ['POPULAR_COUNT', '人気ポスト：抽出数', 130, 'num',
     '「人気ポストをCSVにする」で、いいね数の多い順に何件出すか（実行時に変更も可）'],
-  ['POPULAR_MULTIPLIER', '人気ポスト：多めに読む倍率', 2, 'num',
-    'Xの人気順で「抽出数×この倍率」件を読み込み、その中をいいね数で並べ替える。大きいほど正確・料金も増える（1件約0.005ドル）'],
+  ['POPULAR_MULTIPLIER', '人気ポスト：多めに読む倍率', 2, 'float',
+    'Xの人気順で「抽出数×この倍率」件を読み込み、その中をいいね数で並べ替える。1.5 や 1.1 のような小数もOK（1なら並べ替えなし）。大きいほど正確・料金も増える（1件約0.005ドル）'],
   ['POPULAR_FULL_SCAN', '人気ポスト：直近の投稿を全部調べる', false, 'bool',
     'ON：Xの人気順を使わず、直近の投稿を下の件数まで全部読んでいいね数で並べる（正確だが料金高め）'],
   ['POPULAR_SCAN_MAX', '人気ポスト：全部調べるときの件数', 1000, 'num',
@@ -143,6 +143,12 @@ function loadSettings_() {
     if (!type) return;
     if (type === 'bool') CONFIG[key] = value === true || String(value).toUpperCase() === 'TRUE';
     else if (type === 'num') { const n = parseInt(value, 10); CONFIG[key] = isNaN(n) || n < 0 ? 0 : n; }
+    else if (type === 'float') {
+      // 全角数字・「，」「、」「．」も受け付ける（1,5 → 1.5）
+      const t = String(value).replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/[,，、．]/g, '.');
+      const n = parseFloat(t);
+      CONFIG[key] = isNaN(n) || n < 0 ? 0 : n;
+    }
     else CONFIG[key] = String(value || '').trim();
   });
 }
