@@ -59,6 +59,14 @@ const SETTINGS_DEF = [
   ['SUBFOLDER_PER_POST', 'ポストごとにフォルダを分ける', false, 'bool', 'ON：アカウントのフォルダの中に、さらにポストごとのフォルダを作る'],
   ['PARENT_FOLDER_ID', 'フォルダを作る場所（親フォルダのID）', '', 'str',
     '空ならマイドライブ直下。まとめたいフォルダがあれば、そのURLの folders/ の後ろの部分を貼る'],
+  ['POPULAR_COUNT', '人気ポスト：抽出数', 130, 'num',
+    '「人気ポストをCSVにする」で、いいね数の多い順に何件出すか（実行時に変更も可）'],
+  ['POPULAR_MULTIPLIER', '人気ポスト：多めに読む倍率', 2, 'num',
+    'Xの人気順で「抽出数×この倍率」件を読み込み、その中をいいね数で並べ替える。大きいほど正確・料金も増える（1件約0.005ドル）'],
+  ['POPULAR_FULL_SCAN', '人気ポスト：直近の投稿を全部調べる', false, 'bool',
+    'ON：Xの人気順を使わず、直近の投稿を下の件数まで全部読んでいいね数で並べる（正確だが料金高め）'],
+  ['POPULAR_SCAN_MAX', '人気ポスト：全部調べるときの件数', 1000, 'num',
+    '上の項目がONのときに読む件数（1,000件で約5ドル）'],
 ];
 
 const CONFIG = { MAX_RUNTIME_MS: 5 * 60 * 1000 };
@@ -85,6 +93,8 @@ function onOpen() {
     .addItem('各フォルダの既存ファイルを重複チェックに登録', 'indexExistingFiles')
     .addItem('1時間ごとの自動実行をON', 'installTrigger')
     .addItem('自動実行をOFF', 'removeTrigger')
+    .addSeparator()
+    .addItem('人気ポスト（画像・動画なし）をCSVにする', 'popularToCsv')
     .addSeparator()
     .addSubMenu(SpreadsheetApp.getUi().createMenu('大きい動画（50MB超）')
       .addItem('① GitHub連携を登録', 'bigSaveGithub')
@@ -875,4 +885,137 @@ function bigWeb_(p) {
   } finally {
     lock.releaseLock();
   }
+}
+
+/* ===================== 人気ポスト（画像・動画なし）を CSV にする ===================== */
+/*
+ * メニュー「人気ポスト（画像・動画なし）をCSVにする」→ アカウント名と抽出数を入れる
+ *   1. X の全期間検索で「from:アカウント -has:media」（画像・動画なし、リポスト・返信は除く）を取得
+ *      ふだんは X の人気順（関連性の高い順）で「抽出数×倍率」件を読む
+ *      設定「直近の投稿を全部調べる」がONなら、新しい順に指定件数を読む
+ *   2. 読んだ中をいいね数の多い順に並べ、上位を CSV にしてドライブの「人気ポストCSV」フォルダに保存
+ *   3.「人気ポスト」シートに実行記録とCSVのリンクを残す
+ */
+
+const POP = {
+  SHEET: '人気ポスト',
+  HEADER: ['実行日時', 'account', '抽出数', '読み込んだ投稿数', '方式', 'CSV', 'メモ'],
+  FOLDER: '人気ポストCSV',
+};
+
+function popularToCsv() {
+  loadSettings_();
+  const ui = SpreadsheetApp.getUi();
+  const token = getBearerToken_();
+  if (!token) { ui.alert('スクリプト プロパティ X_BEARER_TOKEN が未設定です。'); return; }
+
+  const r1 = ui.prompt('人気ポストをCSVにする', 'Xのアカウント名（@なし）を入力してください', ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  const name = normName_(r1.getResponseText());
+  if (!/^\w{1,15}$/.test(name)) { ui.alert('アカウント名の形が違います（英数字と _ だけ、15文字まで）。'); return; }
+
+  const def = CONFIG.POPULAR_COUNT || 130;
+  const r2 = ui.prompt('人気ポストをCSVにする', `抽出数を入力してください（空欄なら ${def}）`, ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK) return;
+  const count = parseInt(r2.getResponseText().trim() || def, 10);
+  if (!(count > 0)) { ui.alert('抽出数は1以上の数字で入力してください。'); return; }
+
+  const full = CONFIG.POPULAR_FULL_SCAN;
+  const readMax = full
+    ? Math.max(count, CONFIG.POPULAR_SCAN_MAX || 1000)
+    : Math.ceil(count * Math.max(1, CONFIG.POPULAR_MULTIPLIER || 2));
+  const cost = (readMax * 0.005).toFixed(2);
+  const ok = ui.alert('確認',
+    `@${name} の画像・動画なしのポストを最大 ${readMax} 件読み込み、いいね数の多い順に ${count} 件をCSVにします。\n` +
+    `方式：${full ? '直近の投稿を全部調べる' : 'Xの人気順で多めに読む'}\nX APIの料金の目安：最大 約${cost}ドル\n\n実行しますか？`,
+    ui.ButtonSet.OK_CANCEL);
+  if (ok !== ui.Button.OK) return;
+
+  let msg;
+  try {
+    const posts = popularFetch_(token, name, readMax, full);
+    const top = posts.filter(p => !p.hasMedia)
+      .sort((a, b) => b.likes - a.likes || b.reposts - a.reposts)
+      .slice(0, count);
+    if (!top.length) {
+      popularLog_(name, count, posts.length, full, '', '該当するポストがありません');
+      ui.alert(`@${name} の画像・動画なしのポストが見つかりませんでした（鍵アカウント・アカウント名の間違い・投稿なしの可能性）。`);
+      return;
+    }
+    const file = popularSaveCsv_(name, top);
+    msg = top.length < count ? `${count}件に届かず${top.length}件` : '';
+    popularLog_(name, count, posts.length, full, file.getUrl(), msg);
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(
+      '<div style="font-family:sans-serif;font-size:14px;line-height:1.7">' +
+      `<p>@${esc(name)} の人気ポスト ${top.length} 件をCSVにしました（読み込み ${posts.length} 件）。</p>` +
+      `<p><a href="${esc(file.getUrl())}" target="_blank">${esc(file.getName())} を開く</a></p>` +
+      '<p style="color:#666">ドライブの「人気ポストCSV」フォルダに保存されています。「人気ポスト」シートにも記録があります。</p></div>'
+    ).setWidth(480).setHeight(220), '完了');
+  } catch (e) {
+    popularLog_(name, count, 0, full, '', 'エラー: ' + e.message);
+    ui.alert('エラー: ' + e.message);
+  }
+}
+
+/** 画像・動画なしのポストを読み込む（リポスト・返信は除く） */
+function popularFetch_(token, name, readMax, full) {
+  const out = [];
+  let next = '';
+  while (out.length < readMax) {
+    const q = {
+      query: `from:${name} -has:media -is:retweet -is:reply`,
+      max_results: Math.max(10, Math.min(100, readMax - out.length)),
+      sort_order: full ? 'recency' : 'relevancy',
+      start_time: '2006-03-21T00:00:00Z',
+      'tweet.fields': 'created_at,public_metrics,attachments,note_tweet',
+    };
+    if (next) q.next_token = next;
+    Utilities.sleep(1100); // 全期間検索は1秒に1回まで
+    const qs = Object.keys(q).map(k => k + '=' + encodeURIComponent(q[k])).join('&');
+    const json = xApiGet_(token, 'https://api.x.com/2/tweets/search/all?' + qs);
+    (json.data || []).forEach(t => {
+      const m = t.public_metrics || {};
+      out.push({
+        id: String(t.id),
+        text: (t.note_tweet && t.note_tweet.text) || t.text || '',
+        created: t.created_at ? new Date(t.created_at) : null,
+        likes: m.like_count || 0,
+        reposts: m.retweet_count || 0,
+        replies: m.reply_count || 0,
+        quotes: m.quote_count || 0,
+        bookmarks: m.bookmark_count || 0,
+        views: m.impression_count,
+        hasMedia: !!(t.attachments && t.attachments.media_keys && t.attachments.media_keys.length),
+      });
+    });
+    next = json.meta && json.meta.next_token;
+    if (!next || !(json.data || []).length) break;
+  }
+  return out.slice(0, readMax);
+}
+
+function popularSaveCsv_(name, top) {
+  const head = ['順位', 'いいね', 'リポスト', '返信', '引用', 'ブックマーク', '表示回数', '投稿日時', '本文', 'URL'];
+  const cell = v => {
+    const s = v === null || v === undefined ? '' : String(v);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const tz = Session.getScriptTimeZone() || 'Asia/Tokyo';
+  const rows = top.map((p, i) => [
+    i + 1, p.likes, p.reposts, p.replies, p.quotes, p.bookmarks,
+    p.views === undefined ? '' : p.views,
+    p.created ? Utilities.formatDate(p.created, tz, 'yyyy/MM/dd HH:mm') : '',
+    p.text, `https://x.com/${name}/status/${p.id}`,
+  ]);
+  // 先頭の ﻿ は、Excel で開いたときに日本語が文字化けしないようにするための印
+  const csv = '﻿' + [head].concat(rows).map(r => r.map(cell).join(',')).join('\r\n');
+  const stamp = Utilities.formatDate(new Date(), tz, 'yyyyMMdd_HHmm');
+  const folder = getOrCreateSubfolder_(getParentFolder_(), POP.FOLDER);
+  return folder.createFile(Utilities.newBlob(csv, 'text/csv', `人気ポスト_${name}_${stamp}.csv`));
+}
+
+function popularLog_(name, count, read, full, url, memo) {
+  getSheet_(POP.SHEET, POP.HEADER).appendRow([new Date(), name, count, read,
+    full ? '直近を全部調べる' : 'Xの人気順で多めに読む', url, memo || '']);
 }
