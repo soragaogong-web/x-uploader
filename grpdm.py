@@ -69,6 +69,8 @@ class Account:
             ver = str(info.get("ver") or "1")
         else:
             pin = info.get("pin")
+            if pin and pin == getattr(self, "bad_pin", None):
+                pin = None  # さっき違ったパスコードでは、もう試さない
             if not pin:
                 raise RuntimeError("チャットのパスコードが未登録です(メニュー「③ チャットのパスコードを登録」)")
             keys = public_keys(self.x, uid)
@@ -84,6 +86,10 @@ class Account:
                 chat.unlock(pin)
             except Exception as e:  # noqa: BLE001
                 left = guesses_remaining(e)
+                # 違うパスコードで何度も試すと、回数制限を使い切って鍵が使えなくなるので、手元からも消す
+                # (やり直しのたびに同じパスコードで試さないように。新しいパスコードはGASから受け取る)
+                self.info.pop("pin", None)
+                self.bad_pin = pin
                 gas({"ar": "gd_pinbad", "acct": self.name, "left": "" if left is None else str(left)})
                 raise RuntimeError(f"パスコードが違うか、鍵を取り出せません(残り回数: {left})")
             blob = base64.b64encode(bytes(chat.export_keys())).decode("ascii")
